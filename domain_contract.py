@@ -299,9 +299,20 @@ class DamageAndFreezeTest(unittest.TestCase):
         ))
         incident = self.registry.risk_view(self.work_id)["open_risks"][0]
         with self.assertRaises(DomainError):
-            self.registry.resolve_incident(incident["incident_id"], "  ")
-        result = self.registry.resolve_incident(incident["incident_id"], "修复师与双方馆员复核，确认可继续展出")
+            self.registry.resolve_incident(incident["incident_id"], {"resolution_note": "  "})
+        # 单方复核结论不足以解除风险。
+        with self.assertRaises(DomainError):
+            self.registry.resolve_incident(incident["incident_id"], {
+                "resolution_note": "修复完成",
+                "lender_review": {"org": "甲馆", "person": "修复师甲", "note": "确认可继续展出", "on_date": "2026-09-28"},
+            })
+        result = self.registry.resolve_incident(incident["incident_id"], {
+            "resolution_note": "修复师与双方馆员复核，确认可继续展出",
+            "lender_review": {"org": "甲馆", "person": "修复师甲", "note": "确认可继续展出", "on_date": "2026-09-28"},
+            "borrower_review": {"org": "乙馆", "person": "馆员乙", "note": "同意继续展出", "on_date": "2026-09-28"},
+        })
         self.assertTrue(result["resolved"])
+        self.assertFalse(result["frozen"])
         self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
         self.registry.record_handover(
             handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))

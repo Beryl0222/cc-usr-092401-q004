@@ -13,6 +13,7 @@ from domain import (
     ConflictError,
     DomainError,
     LoanRegistry,
+    ReplayedHandover,
     Route,
     build_routes,
 )
@@ -58,10 +59,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8") or "{}")
             except (ValueError, UnicodeDecodeError):
-                self._write_json(400, {"error": "请求体须为 UTF-8 JSON"})
+                self._write_json(400, {"error": "请求体须为 UTF-8 JSON", "code": "invalid_json"})
                 return
             if not isinstance(body, dict):
-                self._write_json(400, {"error": "请求体须为 JSON 对象"})
+                self._write_json(400, {"error": "请求体须为 JSON 对象", "code": "invalid_json"})
                 return
 
         for route in STATE.routes:  # type: Route
@@ -72,21 +73,29 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 payload = route.handler(STATE.registry, body, match.groupdict())
+            except ReplayedHandover as error:
+                # 完全相同的重试：幂等返回首次交接，状态码 200，
+                # 用 replayed=true 与响应头稳定区分于首次办理。
+                replay = dict(error.view)
+                replay["replayed"] = True
+                self._write_json(200, replay, {"Idempotency-Replayed": "true"})
             except ConflictError as error:
-                self._write_json(409, {"error": str(error)})
+                self._write_json(409, {"error": str(error), "code": error.code})
             except DomainError as error:
-                self._write_json(400, {"error": str(error)})
+                self._write_json(400, {"error": str(error), "code": error.code})
             else:
                 self._write_json(200, payload)
             return
 
         self.send_error(404)
 
-    def _write_json(self, status, payload):
+    def _write_json(self, status, payload, extra_headers=None):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 

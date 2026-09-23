@@ -14,10 +14,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Optional
+from functools import wraps
+from typing import Any, Callable, Iterator, Optional
 
 # ---------------------------------------------------------------------------
 # 词表
@@ -52,13 +56,49 @@ TRANSFER_PAIRS = {
 
 LABEL_STATUS = ("草拟", "已发布", "已更正")
 
+# 指纹各维度在冲突提示中的中文名（仅用于错误信息）。
+_FINGERPRINT_FIELD_LABELS = {
+    "type": "生命周期位置",
+    "from_party": "交出方签认",
+    "to_party": "接收方签认",
+    "on_date": "交接日期",
+    "at_location": "交接地点",
+    "linked_segments": "关联区段",
+    "report": "状态报告",
+}
+
 
 class DomainError(ValueError):
-    """请求违反领域规则（作为 4xx 返回给调用方）。"""
+    """请求违反领域规则（作为 4xx 返回给调用方）。
+
+    ``code`` 是稳定的机器可读错误码，HTTP 层据此区分字段错误、冲突与重放。
+    """
+
+    code = "invalid_request"
+
+    def __init__(self, message: str, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 class ConflictError(DomainError):
     """状态冲突（重复交接、已冻结、已锁定等），语义上是 409。"""
+
+    code = "conflict"
+
+
+class ReplayedHandover(ConflictError):
+    """同一作品、同一扫码号且内容完全一致的重试：不产生新记录，返回首次交接。"""
+
+    code = "replayed_handover"
+
+    def __init__(self, handover: "Handover", view: dict[str, Any]) -> None:
+        super().__init__(
+            f"扫码 {handover.scan_code} 与交接 {handover.handover_id} 内容一致，按重试返回首次交接",
+        )
+        self.handover = handover
+        self.view = view
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +220,7 @@ class Handover:
     on_date: str
     at_location: str
     linked_segments: list[str] = field(default_factory=list)
+    fingerprint: str = ""
 
     @property
     def damaged(self) -> bool:
@@ -188,7 +229,10 @@ class Handover:
 
 @dataclass
 class Incident:
-    """损伤事件：冻结后所有未完成交接，图像哈希作为证据保全。"""
+    """损伤事件：冻结后所有未完成交接，图像哈希作为证据保全。
+
+    解除冻结须同时具备出借馆与承借馆的书面复核结论。
+    """
 
     incident_id: str
     work_id: str
@@ -199,6 +243,19 @@ class Incident:
     after_hashes: list[str]
     resolved: bool = False
     resolution_note: str = ""
+    review_lender: Optional["ReviewConclusion"] = None
+    review_borrower: Optional["ReviewConclusion"] = None
+
+
+@dataclass
+class ReviewConclusion:
+    """某一方对损伤事件的书面复核结论。"""
+
+    side: str  # lender / borrower
+    org: str
+    person: str
+    note: str
+    on_date: str
 
 
 @dataclass
@@ -231,13 +288,36 @@ class LoanRegistry:
         self.agreements: dict[str, Agreement] = {}
         self._agreement_history: dict[str, list[str]] = {}  # work_id → 协议ID（含历史版本）
         self.handovers: list[Handover] = []
-        self._scan_codes: set[str] = set()
+        # (work_id, scan_code) → 已成立的交接；查重与写入共用同一把锁。
+        self._scan_index: dict[tuple[str, str], Handover] = {}
         self.incidents: list[Incident] = []
         self._frozen_works: set[str] = set()
         self.labels: dict[str, list[LabelVersion]] = {}
+        # 同一进程内所有写操作串行化，保证“查重 → 校验 → 写入 → 冻结/转移保管权”原子。
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    @staticmethod
+    def _synchronized(method: Callable[..., Any]) -> Callable[..., Any]:
+        """让整个方法在注册表锁内执行；RLock 可重入，方法间互相调用安全。"""
+
+        @wraps(method)
+        def wrapper(self: "LoanRegistry", *args: Any, **kwargs: Any) -> Any:
+            with self._locked():
+                return method(self, *args, **kwargs)
+
+        return wrapper
 
     # -- 作品结构 ----------------------------------------------------------
 
+    @_synchronized
     def register_work(
         self,
         title: str,
@@ -300,6 +380,7 @@ class LoanRegistry:
 
     # -- 协议 --------------------------------------------------------------
 
+    @_synchronized
     def create_agreement(self, payload: dict[str, Any]) -> dict[str, Any]:
         work = self._work(payload["work_id"])
         agreement_id = payload.get("agreement_id") or f"AGR-{work.work_id}-v1"
@@ -309,6 +390,7 @@ class LoanRegistry:
         self._agreement_history.setdefault(work.work_id, []).append(agreement_id)
         return self._agreement_view(agreement)
 
+    @_synchronized
     def reschedule_agreement(
         self, current_agreement_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
@@ -378,34 +460,63 @@ class LoanRegistry:
     # -- 状态交接 ----------------------------------------------------------
 
     def record_handover(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._locked():
+            return self._record_handover_locked(payload)
+
+    def _record_handover_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         work = self._work(payload["work_id"])
         handover_type = payload["type"]
         if handover_type not in HANDOVER_TYPES:
             raise DomainError(f"交接类型须为 {HANDOVER_TYPES} 之一")
 
-        # 冻结与生命周期先校验，未成立的交接不得消费扫码标识。
-        if work.work_id in self._frozen_works:
-            raise ConflictError(f"作品 {work.work_id} 已因损伤冻结，后续交接全部中止")
-
         scan_code = str(payload["scan_code"])
         if not scan_code.strip():
             raise DomainError("扫码标识不能为空")
-        if scan_code in self._scan_codes:
-            previous = next(h.handover_id for h in self.handovers if h.scan_code == scan_code)
+
+        scan_key = (work.work_id, scan_code)
+        previous = self._scan_index.get(scan_key)
+
+        # 新扫码先做冻结状态校验（与单终端流程的状态码顺序一致）；
+        # 已见过的扫码跳过状态校验，进入下面的幂等判定——
+        # 这样作品已冻结/生命周期已前进时，完全相同的重试仍能返回首次交接。
+        if previous is None and work.work_id in self._frozen_works:
             raise ConflictError(
-                f"扫码 {scan_code} 已在交接 {previous} 使用，重复扫码不能产生第二次交接"
+                f"作品 {work.work_id} 已因损伤冻结，后续交接全部中止",
+                code="work_frozen",
             )
 
+        # 解析/校验请求字段（400 在此抛出），失败一律不触碰扫码索引与交接链。
         expected_from, expected_to = TRANSFER_PAIRS[handover_type]
         from_party = self._signature(payload["from_party"], expected_from)
         to_party = self._signature(payload["to_party"], expected_to)
-        self._assert_lifecycle(work.work_id, handover_type)
-
+        on_date = self._date(payload["on_date"], "交接日期").isoformat()
+        at_location = str(payload.get("at_location", ""))
         linked_segments = list(payload.get("linked_segments") or [])
         for segment_id in linked_segments:
             work.require_segment(segment_id)
-
         report = self._condition_report(payload.get("report") or {})
+
+        parts = self._fingerprint_parts(
+            work.work_id, handover_type, from_party, to_party, report,
+            on_date, at_location, linked_segments,
+        )
+        fingerprint = self._canonical_fingerprint(parts)
+
+        # 幂等层：同一（作品，扫码号）见过的请求直接按首次结果处理。
+        if previous is not None:
+            if previous.fingerprint == fingerprint:
+                raise ReplayedHandover(previous, self._handover_result_view(previous))
+            differing = self._differing_fields(parts, self._stored_parts(previous))
+            labels = [_FINGERPRINT_FIELD_LABELS.get(key, key) for key in differing]
+            raise ConflictError(
+                f"扫码 {scan_code} 已在交接 {previous.handover_id} 使用，重复扫码在"
+                f"{'、'.join(labels)}上不一致，不能产生第二次交接",
+                code="scan_conflict",
+            )
+
+        # 全新扫码才做生命周期校验（409），跳步同样不消耗扫码标识。
+        self._assert_lifecycle(work.work_id, handover_type)
+
         handover = Handover(
             handover_id=_new_id("handover"),
             work_id=work.work_id,
@@ -414,13 +525,17 @@ class LoanRegistry:
             from_party=from_party,
             to_party=to_party,
             report=report,
-            on_date=self._date(payload["on_date"], "交接日期").isoformat(),
-            at_location=str(payload.get("at_location", "")),
+            on_date=on_date,
+            at_location=at_location,
             linked_segments=linked_segments,
+            fingerprint=fingerprint,
         )
-        self._scan_codes.add(scan_code)
-        self.handovers.append(handover)
 
+        # 校验全部通过后才提交：扫码占用、交接入链、（损伤时）冻结与风险登记，
+        # 在同一把锁内一次完成，并发的下一步交接不可能插到冻结之前。
+        incident: Optional[Incident] = None
+        self._scan_index[scan_key] = handover
+        self.handovers.append(handover)
         if handover.damaged:
             self._frozen_works.add(work.work_id)
             incident = Incident(
@@ -433,26 +548,126 @@ class LoanRegistry:
                 after_hashes=list(report.after_hashes),
             )
             self.incidents.append(incident)
-            return self._handover_view(handover, frozen=True, incident_id=incident.incident_id)
+        return self._handover_result_view(handover, incident)
 
-        return self._handover_view(handover, frozen=False)
+    def resolve_incident(self, incident_id: str, payload: dict[str, Any] | str) -> dict[str, Any]:
+        """损伤经双方书面复核后解除；该作品仍有其他未结损伤时继续冻结。"""
+        with self._locked():
+            return self._resolve_incident_locked(incident_id, payload)
 
-    def resolve_incident(self, incident_id: str, resolution_note: str) -> dict[str, Any]:
-        """损伤经双方确认解除后解冻；解除前风险一直挂账。"""
+    def _resolve_incident_locked(self, incident_id: str, payload: dict[str, Any] | str) -> dict[str, Any]:
         incident = next((i for i in self.incidents if i.incident_id == incident_id), None)
         if incident is None:
             raise DomainError(f"损伤事件 {incident_id} 不存在")
-        if not resolution_note or not resolution_note.strip():
+        if incident.resolved:
+            raise ConflictError(
+                f"损伤事件 {incident_id} 已解除，不能重复复核",
+                code="incident_already_resolved",
+            )
+
+        data = payload if isinstance(payload, dict) else {"resolution_note": payload}
+        resolution_note = str(data.get("resolution_note", "") or "").strip()
+        if not resolution_note:
             raise DomainError("解除损伤须填写处理与复核结论")
+        lender = self._review_conclusion(data.get("lender_review"), "出借馆", "lender_review")
+        borrower = self._review_conclusion(data.get("borrower_review"), "承借馆", "borrower_review")
+
         incident.resolved = True
-        incident.resolution_note = resolution_note.strip()
-        self._frozen_works.discard(incident.work_id)
+        incident.resolution_note = resolution_note
+        incident.review_lender = lender
+        incident.review_borrower = borrower
+
+        # 仅当该作品所有未结损伤都已具备双方复核结论（即全部结清）时才解除冻结。
+        still_open = [
+            i for i in self.incidents
+            if i.work_id == incident.work_id and not i.resolved
+        ]
+        if not still_open:
+            self._frozen_works.discard(incident.work_id)
         return {
             "incident_id": incident.incident_id,
             "work_id": incident.work_id,
             "resolved": True,
             "resolution_note": incident.resolution_note,
+            "reviews": {
+                "lender": self._review_view(lender),
+                "borrower": self._review_view(borrower),
+            },
+            "remaining_open_incidents": [i.incident_id for i in still_open],
+            "frozen": bool(still_open) or incident.work_id in self._frozen_works,
         }
+
+    def _review_conclusion(self, raw: Any, side_label: str, field_name: str) -> "ReviewConclusion":
+        if not isinstance(raw, dict):
+            raise DomainError(f"解除损伤须附{side_label}（{field_name}）的书面复核结论")
+        person = str(raw.get("person", "") or "").strip()
+        note = str(raw.get("note", "") or "").strip()
+        if not person:
+            raise DomainError(f"{side_label}复核须签认复核人")
+        if not note:
+            raise DomainError(f"{side_label}复核须填写书面结论")
+        on_date = self._date(raw.get("on_date"), f"{side_label}复核日期").isoformat()
+        return ReviewConclusion(
+            side=side_label,
+            org=str(raw.get("org", "") or "").strip(),
+            person=person,
+            note=note,
+            on_date=on_date,
+        )
+
+    @staticmethod
+    def _review_view(review: "ReviewConclusion") -> dict[str, Any]:
+        return {
+            "side": review.side,
+            "org": review.org,
+            "person": review.person,
+            "note": review.note,
+            "on_date": review.on_date,
+        }
+
+    @staticmethod
+    def _fingerprint_parts(
+        work_id: str,
+        handover_type: str,
+        from_party: "Signature",
+        to_party: "Signature",
+        report: "ConditionReport",
+        on_date: str,
+        at_location: str,
+        linked_segments: list[str],
+    ) -> dict[str, Any]:
+        """决定“同一次交接”的内容维度：生命周期位置、双方签认、日期、状态、区段。"""
+        return {
+            "work_id": work_id,
+            "type": handover_type,
+            "from_party": {"org": from_party.org, "role": from_party.role, "person": from_party.person},
+            "to_party": {"org": to_party.org, "role": to_party.role, "person": to_party.person},
+            "on_date": on_date,
+            "at_location": at_location,
+            "linked_segments": sorted(linked_segments),
+            "report": {
+                "condition": report.condition,
+                "damage_note": report.damage_note,
+                "image_hashes": list(report.image_hashes),
+                "before_hashes": list(report.before_hashes),
+                "after_hashes": list(report.after_hashes),
+            },
+        }
+
+    def _stored_parts(self, handover: "Handover") -> dict[str, Any]:
+        return self._fingerprint_parts(
+            handover.work_id, handover.type, handover.from_party, handover.to_party,
+            handover.report, handover.on_date, handover.at_location, handover.linked_segments,
+        )
+
+    @staticmethod
+    def _canonical_fingerprint(parts: dict[str, Any]) -> str:
+        canonical = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _differing_fields(left: dict[str, Any], right: dict[str, Any]) -> list[str]:
+        return [key for key in left if left.get(key) != right.get(key)]
 
     def _assert_lifecycle(self, work_id: str, handover_type: str) -> None:
         completed = [h.type for h in self.handovers if h.work_id == work_id]
@@ -499,6 +714,7 @@ class LoanRegistry:
 
     # -- 策展展签 ----------------------------------------------------------
 
+    @_synchronized
     def create_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         work = self._work(work_id)
         if work_id in self.labels:
@@ -517,6 +733,7 @@ class LoanRegistry:
         self.labels[work_id] = [version]
         return self._label_view(work_id, version)
 
+    @_synchronized
     def publish_label(self, work_id: str, published_on: str) -> dict[str, Any]:
         """发布日期确认：锁定证据快照。快照只含当时的数据，之后不再变化。"""
         versions = self.labels.get(work_id)
@@ -532,6 +749,7 @@ class LoanRegistry:
         current.evidence = self._evidence_snapshot(work_id)
         return self._label_view(work_id, current)
 
+    @_synchronized
     def correct_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         """学术更正：另起新版本，旧版展签与其证据快照原样保留。"""
         versions = self.labels.get(work_id)
@@ -613,6 +831,7 @@ class LoanRegistry:
 
     # -- 查询视图 ----------------------------------------------------------
 
+    @_synchronized
     def get_work_view(self, work_id: str) -> dict[str, Any]:
         work = self._work(work_id)
         agreement = self._current_agreement(work_id)
@@ -649,6 +868,7 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def risk_view(self, work_id: str) -> dict[str, Any]:
         """从展签/策展侧回答：实体在哪、谁保管、授权到哪、风险是否解除。"""
         work = self._work(work_id)
@@ -671,6 +891,7 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def locate_segment(self, work_id: str, segment_id: str) -> dict[str, Any]:
         """局部状态争议入口：从区段定位实体、贡献、当前保管与风险。"""
         work = self._work(work_id)
@@ -720,6 +941,7 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def label_version(self, work_id: str, version: Optional[int] = None) -> dict[str, Any]:
         versions = self.labels.get(self._work(work_id).work_id)
         if not versions:
@@ -783,6 +1005,20 @@ class LoanRegistry:
             "insurance": agreement.insurance,
             "digital_rights": agreement.digital_rights,
         }
+
+    def _handover_result_view(
+        self, handover: Handover, incident: Optional[Incident] = None
+    ) -> dict[str, Any]:
+        """一次交接成立（或按重试回放）后返回给调用方的视图。"""
+        if incident is None and handover.damaged:
+            incident = next(
+                (i for i in self.incidents if i.handover_id == handover.handover_id), None
+            )
+        return self._handover_view(
+            handover,
+            frozen=handover.damaged,
+            incident_id=incident.incident_id if incident else None,
+        )
 
     def _handover_view(self, handover: Handover, frozen: bool = False, incident_id: Optional[str] = None) -> dict[str, Any]:
         view = {
@@ -852,7 +1088,7 @@ def build_routes() -> list[Route]:
               lambda reg, body, p: reg.reschedule_agreement(p["id"], body)),
         Route("POST", r"^/handovers$", lambda reg, body, _: reg.record_handover(body)),
         Route("POST", r"^/incidents/(?P<id>[^/]+)/resolve$",
-              lambda reg, body, p: reg.resolve_incident(p["id"], body.get("resolution_note", ""))),
+              lambda reg, body, p: reg.resolve_incident(p["id"], body)),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels$",
               lambda reg, body, p: reg.create_label(p["id"], body["narrative"], body.get("citations", []))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels/publish$",
