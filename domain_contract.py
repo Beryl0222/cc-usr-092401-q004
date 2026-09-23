@@ -300,11 +300,27 @@ class DamageAndFreezeTest(unittest.TestCase):
         incident = self.registry.risk_view(self.work_id)["open_risks"][0]
         with self.assertRaises(DomainError):
             self.registry.resolve_incident(incident["incident_id"], "  ")
-        result = self.registry.resolve_incident(incident["incident_id"], "修复师与双方馆员复核，确认可继续展出")
+        both_reviews = [
+            {"party": "交出方", "org": "长风运输", "role": "运输方", "person": "押运员",
+             "conclusion": "到馆开箱前未见此磨损，运输环节无碰撞记录"},
+            {"party": "接收方", "org": "乙馆", "role": "承借馆", "person": "库管员",
+             "conclusion": "接收检视确认边缘轻微磨损，不影响展出"},
+        ]
+        # 单方复核不能解除。
+        with self.assertRaises(DomainError):
+            self.registry.resolve_incident(incident["incident_id"], "仅一方结论", reviews=both_reviews[:1])
+        result = self.registry.resolve_incident(
+            incident["incident_id"], "修复师与双方馆员复核，确认可继续展出", reviews=both_reviews)
         self.assertTrue(result["resolved"])
+        self.assertFalse(result["frozen"])
+        self.assertEqual(len(result["reviews"]), 2)
         self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
         self.registry.record_handover(
             handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+        # 已解除的事件不能重复解除。
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(
+                incident["incident_id"], "再次解除", reviews=both_reviews)
 
 
 class LabelSnapshotTest(unittest.TestCase):

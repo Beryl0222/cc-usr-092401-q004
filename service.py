@@ -13,6 +13,7 @@ from domain import (
     ConflictError,
     DomainError,
     LoanRegistry,
+    ReplayConflict,
     Route,
     build_routes,
 )
@@ -58,10 +59,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8") or "{}")
             except (ValueError, UnicodeDecodeError):
-                self._write_json(400, {"error": "请求体须为 UTF-8 JSON"})
+                self._write_json(400, {"error": "请求体须为 UTF-8 JSON", "kind": "invalid_request"})
                 return
             if not isinstance(body, dict):
-                self._write_json(400, {"error": "请求体须为 JSON 对象"})
+                self._write_json(400, {"error": "请求体须为 JSON 对象", "kind": "invalid_request"})
                 return
 
         for route in STATE.routes:  # type: Route
@@ -72,21 +73,35 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 payload = route.handler(STATE.registry, body, match.groupdict())
+            except ReplayConflict as error:
+                # 同扫码号但签认/日期/状态/关联区段不同：真正的冲突。
+                self._write_error(409, error, "scan_conflict")
             except ConflictError as error:
-                self._write_json(409, {"error": str(error)})
+                # 生命周期跳步、已冻结、已锁定等状态冲突。
+                self._write_error(409, error, "conflict")
             except DomainError as error:
-                self._write_json(400, {"error": str(error)})
+                # 字段不合法、缺签认、角色不符等请求错误。
+                self._write_error(400, error, "invalid_request")
             else:
-                self._write_json(200, payload)
+                # 完全相同的重试返回首次交接，视图带 replay 标记；
+                # 用响应头让调用方无需解析体即可识别重放。
+                headers = {"Idempotency-Replayed": "true"} if payload.get("replay") else None
+                self._write_json(200, payload, headers)
             return
 
         self.send_error(404)
 
-    def _write_json(self, status, payload):
+    def _write_error(self, status, error, kind):
+        """错误响应带稳定 kind，供调用方区分重放/冲突/字段错误。"""
+        self._write_json(status, {"error": str(error), "kind": kind})
+
+    def _write_json(self, status, payload, extra_headers=None):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 

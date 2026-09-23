@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Optional
@@ -59,6 +60,14 @@ class DomainError(ValueError):
 
 class ConflictError(DomainError):
     """状态冲突（重复交接、已冻结、已锁定等），语义上是 409。"""
+
+
+class ReplayConflict(ConflictError):
+    """同扫码号但内容与首次交接不一致：真正的冲突，语义上是 409。
+
+    与之相对，完全相同的重试不抛异常——``record_handover`` 直接返回
+    首次交接视图（``replay=True``），HTTP 层据此加重放响应头。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +208,7 @@ class Incident:
     after_hashes: list[str]
     resolved: bool = False
     resolution_note: str = ""
+    reviews: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -219,6 +229,18 @@ class LabelVersion:
 # ---------------------------------------------------------------------------
 
 
+def _synchronized(method: Callable) -> Callable:
+    """让领域方法在注册表的共同锁内执行（锁可重入，嵌套调用安全）。"""
+
+    def guarded(self: "LoanRegistry", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    guarded.__name__ = method.__name__
+    guarded.__doc__ = method.__doc__
+    return guarded
+
+
 class LoanRegistry:
     """保存全部借展记录并强制业务规则。
 
@@ -231,13 +253,17 @@ class LoanRegistry:
         self.agreements: dict[str, Agreement] = {}
         self._agreement_history: dict[str, list[str]] = {}  # work_id → 协议ID（含历史版本）
         self.handovers: list[Handover] = []
-        self._scan_codes: set[str] = set()
+        self._scan_codes: dict[str, str] = {}  # 扫码标识 → 交接ID（原子占用与重放比对）
         self.incidents: list[Incident] = []
         self._frozen_works: set[str] = set()
         self.labels: dict[str, list[LabelVersion]] = {}
+        # 交接链串行化的共同锁：以作品生命周期 + 扫码号共同保护校验、
+        # 双方签认、状态报告、风险事件与保管权更新，杜绝“查重与写入之间”的窗口。
+        self._lock = threading.RLock()
 
     # -- 作品结构 ----------------------------------------------------------
 
+    @_synchronized
     def register_work(
         self,
         title: str,
@@ -300,6 +326,7 @@ class LoanRegistry:
 
     # -- 协议 --------------------------------------------------------------
 
+    @_synchronized
     def create_agreement(self, payload: dict[str, Any]) -> dict[str, Any]:
         work = self._work(payload["work_id"])
         agreement_id = payload.get("agreement_id") or f"AGR-{work.work_id}-v1"
@@ -309,6 +336,7 @@ class LoanRegistry:
         self._agreement_history.setdefault(work.work_id, []).append(agreement_id)
         return self._agreement_view(agreement)
 
+    @_synchronized
     def reschedule_agreement(
         self, current_agreement_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
@@ -378,84 +406,252 @@ class LoanRegistry:
     # -- 状态交接 ----------------------------------------------------------
 
     def record_handover(self, payload: dict[str, Any]) -> dict[str, Any]:
-        work = self._work(payload["work_id"])
-        handover_type = payload["type"]
-        if handover_type not in HANDOVER_TYPES:
-            raise DomainError(f"交接类型须为 {HANDOVER_TYPES} 之一")
+        """办理一次双方签认的交接；校验、占用与写入在同一临界区内原子完成。
 
-        # 冻结与生命周期先校验，未成立的交接不得消费扫码标识。
-        if work.work_id in self._frozen_works:
-            raise ConflictError(f"作品 {work.work_id} 已因损伤冻结，后续交接全部中止")
+        并发语义（作品生命周期 + 扫码号共同保护）：
 
-        scan_code = str(payload["scan_code"])
-        if not scan_code.strip():
-            raise DomainError("扫码标识不能为空")
-        if scan_code in self._scan_codes:
-            previous = next(h.handover_id for h in self.handovers if h.scan_code == scan_code)
-            raise ConflictError(
-                f"扫码 {scan_code} 已在交接 {previous} 使用，重复扫码不能产生第二次交接"
-            )
+        - 两台终端以同一扫码号几乎同时提交时，只有一条请求能写入；
+          另一条按内容判定——完全相同的重试直接返回首次交接视图
+          （``replay=True``，HTTP 200 重放），签认/日期/状态/关联区段
+          任一不同抛 :class:`ReplayConflict`（HTTP 409），均不产生第二条记录。
+        - 任何校验失败都发生在占用扫码号之前，失败请求不消费扫码号。
+        - 状态报告为“损伤”时，事件登记、冻结与交接链追加同一临界区完成，
+          冻结必先于其后任何保管权转移。
+        """
+        with self._lock:
+            handover_type = payload.get("type")
+            if handover_type not in HANDOVER_TYPES:
+                raise DomainError(f"交接类型须为 {HANDOVER_TYPES} 之一")
 
-        expected_from, expected_to = TRANSFER_PAIRS[handover_type]
-        from_party = self._signature(payload["from_party"], expected_from)
-        to_party = self._signature(payload["to_party"], expected_to)
-        self._assert_lifecycle(work.work_id, handover_type)
+            scan_code = str(payload.get("scan_code", ""))
+            if not scan_code.strip():
+                raise DomainError("扫码标识不能为空")
 
-        linked_segments = list(payload.get("linked_segments") or [])
-        for segment_id in linked_segments:
-            work.require_segment(segment_id)
+            # 重放判定先于一切（扫码号全局唯一）：扫码已有归属时必须给出
+            # 确定答复，后到请求既不能借字段错误改写事实，也不能复制首条记录。
+            existing_id = self._scan_codes.get(scan_code)
+            if existing_id is not None:
+                return self._replay_view_or_conflict(scan_code, existing_id, payload)
 
-        report = self._condition_report(payload.get("report") or {})
-        handover = Handover(
-            handover_id=_new_id("handover"),
-            work_id=work.work_id,
-            type=handover_type,
-            scan_code=scan_code,
-            from_party=from_party,
-            to_party=to_party,
-            report=report,
-            on_date=self._date(payload["on_date"], "交接日期").isoformat(),
-            at_location=str(payload.get("at_location", "")),
-            linked_segments=linked_segments,
-        )
-        self._scan_codes.add(scan_code)
-        self.handovers.append(handover)
+            work = self._work(payload["work_id"])
 
-        if handover.damaged:
-            self._frozen_works.add(work.work_id)
-            incident = Incident(
-                incident_id=_new_id("incident"),
+            # 冻结与生命周期校验：未成立的交接不得消费扫码标识。
+            if work.work_id in self._frozen_works:
+                raise ConflictError(f"作品 {work.work_id} 已因损伤冻结，后续交接全部中止")
+
+            expected_from, expected_to = TRANSFER_PAIRS[handover_type]
+            from_party = self._signature(payload["from_party"], expected_from)
+            to_party = self._signature(payload["to_party"], expected_to)
+            self._assert_lifecycle(work.work_id, handover_type)
+
+            linked_segments = list(payload.get("linked_segments") or [])
+            for segment_id in linked_segments:
+                work.require_segment(segment_id)
+
+            report = self._condition_report(payload.get("report") or {})
+            handover = Handover(
+                handover_id=_new_id("handover"),
                 work_id=work.work_id,
-                handover_id=handover.handover_id,
-                on_date=handover.on_date,
-                note=report.damage_note,
-                before_hashes=list(report.before_hashes),
-                after_hashes=list(report.after_hashes),
+                type=handover_type,
+                scan_code=scan_code,
+                from_party=from_party,
+                to_party=to_party,
+                report=report,
+                on_date=self._date(payload["on_date"], "交接日期").isoformat(),
+                at_location=str(payload.get("at_location", "")),
+                linked_segments=linked_segments,
             )
-            self.incidents.append(incident)
-            return self._handover_view(handover, frozen=True, incident_id=incident.incident_id)
 
-        return self._handover_view(handover, frozen=False)
+            # 临界区末尾一次性提交：扫码占用、交接链追加（即保管权更新）、
+            # 风险事件登记与冻结原子可见；此前任何异常都不会留下痕迹。
+            self._scan_codes[scan_code] = handover.handover_id
+            self.handovers.append(handover)
 
-    def resolve_incident(self, incident_id: str, resolution_note: str) -> dict[str, Any]:
-        """损伤经双方确认解除后解冻；解除前风险一直挂账。"""
-        incident = next((i for i in self.incidents if i.incident_id == incident_id), None)
-        if incident is None:
-            raise DomainError(f"损伤事件 {incident_id} 不存在")
-        if not resolution_note or not resolution_note.strip():
-            raise DomainError("解除损伤须填写处理与复核结论")
-        incident.resolved = True
-        incident.resolution_note = resolution_note.strip()
-        self._frozen_works.discard(incident.work_id)
-        return {
-            "incident_id": incident.incident_id,
-            "work_id": incident.work_id,
-            "resolved": True,
-            "resolution_note": incident.resolution_note,
+            if handover.damaged:
+                self._frozen_works.add(work.work_id)
+                incident = Incident(
+                    incident_id=_new_id("incident"),
+                    work_id=work.work_id,
+                    handover_id=handover.handover_id,
+                    on_date=handover.on_date,
+                    note=report.damage_note,
+                    before_hashes=list(report.before_hashes),
+                    after_hashes=list(report.after_hashes),
+                )
+                self.incidents.append(incident)
+                return self._commit_view(handover, frozen=True, incident_id=incident.incident_id)
+
+            return self._commit_view(handover, frozen=False)
+
+    # 参与重放判定的字段：作品、步骤、双方签认、日期、地点、状态报告、关联区段。
+    _REPLAY_FIELDS = (
+        "work_id", "type", "from_party", "to_party", "on_date",
+        "at_location", "report", "linked_segments",
+    )
+
+    def _replay_view_or_conflict(
+        self, scan_code: str, existing_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """扫码已被占用时判定后到请求：同内容重放返回首条视图，否则冲突。"""
+        previous = next(h for h in self.handovers if h.handover_id == existing_id)
+        incident = next(
+            (i for i in self.incidents if i.handover_id == previous.handover_id), None
+        )
+
+        def party(raw: Any) -> dict[str, str]:
+            raw = raw if isinstance(raw, dict) else {}
+            return {
+                "org": str(raw.get("org", "") or ""),
+                "role": str(raw.get("role", "") or ""),
+                "person": str(raw.get("person", "") or ""),
+            }
+
+        def day(raw: Any) -> str:
+            try:
+                return self._date(raw, "交接日期").isoformat()
+            except DomainError:
+                return f"<无效日期:{raw}>"
+
+        def report_fp(raw: Any) -> dict[str, Any]:
+            raw = raw if isinstance(raw, dict) else {}
+            return (
+                str(raw.get("condition", "良好")),
+                str(raw.get("damage_note", "") or "").strip(),
+                [self._image_hash(h) for h in raw.get("image_hashes", [])],
+                [self._image_hash(h) for h in raw.get("before_hashes", [])],
+                [self._image_hash(h) for h in raw.get("after_hashes", [])],
+            )
+
+        candidate = {
+            "work_id": payload.get("work_id"),
+            "type": payload.get("type"),
+            "from_party": party(payload.get("from_party")),
+            "to_party": party(payload.get("to_party")),
+            "on_date": day(payload.get("on_date")),
+            "at_location": str(payload.get("at_location", "") or ""),
+            "report": report_fp(payload.get("report")),
+            "linked_segments": list(payload.get("linked_segments") or []),
         }
+        established = {
+            "work_id": previous.work_id,
+            "type": previous.type,
+            "from_party": {"org": previous.from_party.org, "role": previous.from_party.role,
+                           "person": previous.from_party.person},
+            "to_party": {"org": previous.to_party.org, "role": previous.to_party.role,
+                         "person": previous.to_party.person},
+            "on_date": previous.on_date,
+            "at_location": previous.at_location,
+            "report": (
+                previous.report.condition,
+                previous.report.damage_note,
+                list(previous.report.image_hashes),
+                list(previous.report.before_hashes),
+                list(previous.report.after_hashes),
+            ),
+            "linked_segments": list(previous.linked_segments),
+        }
+        differs = [name for name in self._REPLAY_FIELDS if candidate[name] != established[name]]
+        if not differs:
+            # 重放还原首次提交时的响应：损伤交接首次成立即带冻结与事件号。
+            return self._commit_view(
+                previous,
+                frozen=previous.damaged,
+                incident_id=incident.incident_id if incident else None,
+                replay=True,
+            )
+        raise ReplayConflict(
+            f"扫码 {scan_code} 已在交接 {previous.handover_id} 使用，重复扫码不能产生第二次交接；"
+            f"本次提交的{'、'.join(differs)}与首次交接不一致"
+        )
+
+    def resolve_incident(
+        self,
+        incident_id: str,
+        resolution_note: str,
+        reviews: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """凭双方书面复核结论解除单条损伤；冻结须待全部未结损伤结案才解除。
+
+        ``reviews`` 须分别给出该次交接交出方与接收方的复核结论
+        （``party`` 为 ``交出方`` / ``接收方``，带 ``person`` 与 ``conclusion``）。
+        只要作品下还存在任何未结损伤，冻结就继续生效。
+        """
+        with self._lock:
+            incident = next((i for i in self.incidents if i.incident_id == incident_id), None)
+            if incident is None:
+                raise DomainError(f"损伤事件 {incident_id} 不存在")
+            if incident.resolved:
+                raise ConflictError(f"损伤事件 {incident_id} 已由双方复核解除，不能重复解除")
+            note = (resolution_note or "").strip()
+            if not note:
+                raise DomainError("解除损伤须填写处理与复核结论")
+
+            handover = next(h for h in self.handovers if h.handover_id == incident.handover_id)
+            accepted = self._both_party_reviews(handover, reviews or [])
+
+            incident.resolved = True
+            incident.resolution_note = note
+            incident.reviews = accepted
+
+            open_incidents = [
+                i for i in self.incidents if i.work_id == incident.work_id and not i.resolved
+            ]
+            still_frozen = bool(open_incidents)
+            if not still_frozen:
+                self._frozen_works.discard(incident.work_id)
+            return {
+                "incident_id": incident.incident_id,
+                "work_id": incident.work_id,
+                "resolved": True,
+                "resolution_note": incident.resolution_note,
+                "reviews": incident.reviews,
+                "frozen": still_frozen,
+                "open_incidents": len(open_incidents),
+            }
+
+    @staticmethod
+    def _both_party_reviews(
+        handover: Handover, reviews: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """核对两条复核结论分别来自该次交接的交出方与接收方。"""
+        expected = {
+            "交出方": (handover.from_party.org, handover.from_party.role),
+            "接收方": (handover.to_party.org, handover.to_party.role),
+        }
+        by_party: dict[str, dict[str, str]] = {}
+        for raw in reviews:
+            if not isinstance(raw, dict):
+                raise DomainError("复核结论格式不正确")
+            party = raw.get("party")
+            if party not in expected:
+                raise DomainError("每条复核结论须标明 party 为 交出方 或 接收方")
+            person = str(raw.get("person", "") or "").strip()
+            conclusion = str(raw.get("conclusion", "") or "").strip()
+            if not person:
+                raise DomainError(f"{party}复核结论须填写复核人")
+            if not conclusion:
+                raise DomainError(f"{party}复核结论须填写书面结论")
+            role = str(raw.get("role", expected[party][1]) or "")
+            if role != expected[party][1]:
+                raise DomainError(f"{party}复核须由角色 {expected[party][1]} 作出，收到 {role}")
+            if party in by_party:
+                raise DomainError(f"{party}只能提交一条复核结论")
+            by_party[party] = {
+                "party": party,
+                "org": str(raw.get("org", expected[party][0]) or ""),
+                "role": role,
+                "person": person,
+                "conclusion": conclusion,
+            }
+        missing = [p for p in ("交出方", "接收方") if p not in by_party]
+        if missing:
+            raise DomainError(f"解除损伤须有{'、'.join(missing)}的书面复核结论")
+        return [by_party["交出方"], by_party["接收方"]]
 
     def _assert_lifecycle(self, work_id: str, handover_type: str) -> None:
         completed = [h.type for h in self.handovers if h.work_id == work_id]
+        if len(completed) >= len(HANDOVER_TYPES):
+            raise ConflictError(f"作品 {work_id} 的交接链已随归还完结，不能再办理交接")
         expected = HANDOVER_TYPES[len(completed)]
         if handover_type != expected:
             raise ConflictError(
@@ -499,6 +695,7 @@ class LoanRegistry:
 
     # -- 策展展签 ----------------------------------------------------------
 
+    @_synchronized
     def create_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         work = self._work(work_id)
         if work_id in self.labels:
@@ -517,6 +714,7 @@ class LoanRegistry:
         self.labels[work_id] = [version]
         return self._label_view(work_id, version)
 
+    @_synchronized
     def publish_label(self, work_id: str, published_on: str) -> dict[str, Any]:
         """发布日期确认：锁定证据快照。快照只含当时的数据，之后不再变化。"""
         versions = self.labels.get(work_id)
@@ -532,6 +730,7 @@ class LoanRegistry:
         current.evidence = self._evidence_snapshot(work_id)
         return self._label_view(work_id, current)
 
+    @_synchronized
     def correct_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         """学术更正：另起新版本，旧版展签与其证据快照原样保留。"""
         versions = self.labels.get(work_id)
@@ -613,6 +812,7 @@ class LoanRegistry:
 
     # -- 查询视图 ----------------------------------------------------------
 
+    @_synchronized
     def get_work_view(self, work_id: str) -> dict[str, Any]:
         work = self._work(work_id)
         agreement = self._current_agreement(work_id)
@@ -646,9 +846,22 @@ class LoanRegistry:
             "current_agreement": agreement.agreement_id if agreement else None,
             "agreement_versions": list(self._agreement_history.get(work_id, [])),
             "custody": self._custody(work_id),
+            "handover_chain": [
+                {
+                    "handover_id": h.handover_id,
+                    "type": h.type,
+                    "scan_code": h.scan_code,
+                    "on_date": h.on_date,
+                    "custodian_role": h.to_party.role,
+                    "resulting_status": STATUS_AFTER[h.type],
+                    "damaged": h.damaged,
+                }
+                for h in self.handovers if h.work_id == work_id
+            ],
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def risk_view(self, work_id: str) -> dict[str, Any]:
         """从展签/策展侧回答：实体在哪、谁保管、授权到哪、风险是否解除。"""
         work = self._work(work_id)
@@ -671,6 +884,7 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def locate_segment(self, work_id: str, segment_id: str) -> dict[str, Any]:
         """局部状态争议入口：从区段定位实体、贡献、当前保管与风险。"""
         work = self._work(work_id)
@@ -720,6 +934,7 @@ class LoanRegistry:
             "frozen": work_id in self._frozen_works,
         }
 
+    @_synchronized
     def label_version(self, work_id: str, version: Optional[int] = None) -> dict[str, Any]:
         versions = self.labels.get(self._work(work_id).work_id)
         if not versions:
@@ -783,6 +998,16 @@ class LoanRegistry:
             "insurance": agreement.insurance,
             "digital_rights": agreement.digital_rights,
         }
+
+    def _commit_view(
+        self, handover: Handover, frozen: bool = False, incident_id: Optional[str] = None,
+        replay: bool = False,
+    ) -> dict[str, Any]:
+        view = self._handover_view(handover, frozen=frozen, incident_id=incident_id)
+        if replay:
+            view["replay"] = True
+            view["replay_of"] = handover.handover_id
+        return view
 
     def _handover_view(self, handover: Handover, frozen: bool = False, incident_id: Optional[str] = None) -> dict[str, Any]:
         view = {
@@ -852,7 +1077,8 @@ def build_routes() -> list[Route]:
               lambda reg, body, p: reg.reschedule_agreement(p["id"], body)),
         Route("POST", r"^/handovers$", lambda reg, body, _: reg.record_handover(body)),
         Route("POST", r"^/incidents/(?P<id>[^/]+)/resolve$",
-              lambda reg, body, p: reg.resolve_incident(p["id"], body.get("resolution_note", ""))),
+              lambda reg, body, p: reg.resolve_incident(
+                  p["id"], body.get("resolution_note", ""), body.get("reviews"))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels$",
               lambda reg, body, p: reg.create_label(p["id"], body["narrative"], body.get("citations", []))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels/publish$",
